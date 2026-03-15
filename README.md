@@ -2,13 +2,13 @@
 
 **[中文](./README_zh.md) | English**
 
-<img src="images/2.png" alt="RedInk - Inspiration at Your Fingertips, Making Creation Effortless" width="600"/>
+<img src="images/2_en.png" alt="RedInk - Inspiration at Your Fingertips, Making Creation Effortless" width="600"/>
 
 #### [Official Site → Redink.top](https://redink.top)
 
-<img src="images/showcase-grid.png" alt="Various Xiaohongshu covers generated with RedInk" width="700" style="border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.12);"/>
+<img src="images/showcase-grid-en.png" alt="Various social media covers generated with RedInk" width="700" style="border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.12);"/>
 
-<sub>*Various Xiaohongshu (Little Red Book) covers generated with RedInk - AI-powered, consistent style, accurate text*</sub>
+<sub>*Various social media covers generated with RedInk - AI-powered, consistent style, accurate text*</sub>
 
 </div>
 

@@ -269,6 +269,8 @@ def _load_provider_config(provider_type: str, provider_name: str, config: dict) 
                     config['base_url'] = saved.get('base_url')
                 if not config['model']:
                     config['model'] = saved.get('model')
+                if not config.get('endpoint_type'):
+                    config['endpoint_type'] = saved.get('endpoint_type')
 
     return config
 
@@ -401,8 +403,36 @@ def _test_image_api(config: dict) -> dict:
     base_url = config['base_url'].rstrip('/') if config.get('base_url') else 'https://api.openai.com'
     if base_url.endswith('/v1'):
         base_url = base_url[:-3]
-    url = f"{base_url}/v1/models"
 
+    endpoint_type = config.get('endpoint_type', '')
+
+    # 如果端点是 chat/completions 类型（如豆包），用 POST 发送简单请求来测试
+    if endpoint_type and ('chat' in endpoint_type or 'completions' in endpoint_type):
+        endpoint = endpoint_type if endpoint_type.startswith('/') else '/' + endpoint_type
+        url = f"{base_url}{endpoint}"
+        response = requests.post(
+            url,
+            headers={
+                'Authorization': f"Bearer {config['api_key']}",
+                'Content-Type': 'application/json'
+            },
+            json={
+                "model": config.get('model', 'test'),
+                "messages": [{"role": "user", "content": "test"}],
+                "max_tokens": 1
+            },
+            timeout=30
+        )
+        # 只要不是 401/403 认证错误，就说明连接可用
+        if response.status_code in (401, 403):
+            raise Exception(f"HTTP {response.status_code}: {response.text[:200]}")
+        return {
+            "success": True,
+            "message": "连接成功！仅代表连接稳定，不确定是否可以稳定支持图片生成"
+        }
+
+    # 标准 images API，尝试 /v1/models
+    url = f"{base_url}/v1/models"
     response = requests.get(
         url,
         headers={'Authorization': f"Bearer {config['api_key']}"},
