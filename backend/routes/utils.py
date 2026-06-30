@@ -7,6 +7,10 @@ API 路由工具函数
 import logging
 import traceback
 
+from flask import jsonify
+
+from backend.errors import AppError, ensure_app_error, error_payload
+
 logger = logging.getLogger(__name__)
 
 
@@ -48,6 +52,49 @@ def log_error(endpoint: str, error: Exception):
     logger.error(f"  错误类型: {type(error).__name__}")
     logger.error(f"  错误信息: {str(error)}")
     logger.debug(f"  堆栈跟踪:\n{traceback.format_exc()}")
+
+
+def api_error_response(error, status: int = None, context: dict = None):
+    """返回统一结构化 API 错误响应。"""
+    app_error = ensure_app_error(error, context=context)
+    if status is not None:
+        app_error.status = status
+    status_code = app_error.status
+    return jsonify(error_payload(app_error)), status_code
+
+
+def validation_error(detail: str, suggestion: str = "请检查输入后重试") -> AppError:
+    """构造参数校验错误。"""
+    return AppError(
+        code="INVALID_REQUEST",
+        title="请求参数不完整",
+        detail=detail,
+        suggestion=suggestion,
+        status=400,
+        retryable=False,
+    )
+
+
+def normalize_error_result(result: dict, context: dict = None, fallback_status: int = 500) -> dict:
+    """将 service 返回的旧格式错误转换为统一错误对象，同时保留兼容字段。"""
+    if result.get("success", False):
+        return result
+
+    error = result.get("error") or result.get("error_message") or "操作失败"
+    if isinstance(error, dict) and error.get("code"):
+        error_obj = error
+        error_message = result.get("error_message") or f"{error_obj.get('title', '操作失败')}：{error_obj.get('suggestion') or error_obj.get('detail', '')}"
+    else:
+        app_error = ensure_app_error(error, context=context)
+        if app_error.status == 500 and fallback_status != 500:
+            app_error.status = fallback_status
+        error_obj = app_error.to_dict()
+        error_message = app_error.to_message()
+
+    next_result = dict(result)
+    next_result["error"] = error_obj
+    next_result["error_message"] = error_message
+    return next_result
 
 
 def mask_api_key(key: str) -> str:
