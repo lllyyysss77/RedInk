@@ -10,7 +10,13 @@ import base64
 import logging
 from flask import Blueprint, request, jsonify
 from backend.services.outline import get_outline_service
-from .utils import log_request, log_error
+from .utils import (
+    api_error_response,
+    log_request,
+    log_error,
+    normalize_error_result,
+    validation_error,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,10 +55,10 @@ def create_outline_blueprint():
             # 验证必填参数
             if not topic:
                 logger.warning("大纲生成请求缺少 topic 参数")
-                return jsonify({
-                    "success": False,
-                    "error": "参数错误：topic 不能为空。\n请提供要生成图文的主题内容。"
-                }), 400
+                return api_error_response(
+                    validation_error("topic 不能为空", "请输入要生成图文的主题内容。"),
+                    context={"endpoint": "/api/outline"},
+                )
 
             # 调用大纲生成服务
             logger.info(f"🔄 开始生成大纲，主题: {topic[:50]}...")
@@ -66,15 +72,16 @@ def create_outline_blueprint():
                 return jsonify(result), 200
             else:
                 logger.error(f"❌ 大纲生成失败: {result.get('error', '未知错误')}")
-                return jsonify(result), 500
+                result = normalize_error_result(
+                    result,
+                    context={"endpoint": "/api/outline"},
+                    fallback_status=500,
+                )
+                return jsonify(result), result["error"].get("status", 500)
 
         except Exception as e:
             log_error('/outline', e)
-            error_msg = str(e)
-            return jsonify({
-                "success": False,
-                "error": f"大纲生成异常。\n错误详情: {error_msg}\n建议：检查后端日志获取更多信息"
-            }), 500
+            return api_error_response(e, context={"endpoint": "/api/outline"})
 
     return outline_bp
 

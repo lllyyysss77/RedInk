@@ -9,11 +9,22 @@
 
 import logging
 from pathlib import Path
+from typing import NamedTuple
 import yaml
 from flask import Blueprint, request, jsonify
-from .utils import prepare_providers_for_response
+from .utils import (
+    api_error_response,
+    prepare_providers_for_response,
+    validation_error,
+)
 
 logger = logging.getLogger(__name__)
+
+
+class LlmSmokeResult(NamedTuple):
+    text: str
+    source: str
+    finish_reason: str
 
 # 配置文件路径
 CONFIG_DIR = Path(__file__).parent.parent.parent
@@ -70,10 +81,7 @@ def create_config_blueprint():
             })
 
         except Exception as e:
-            return jsonify({
-                "success": False,
-                "error": f"获取配置失败: {str(e)}"
-            }), 500
+            return api_error_response(e, context={"endpoint": "/api/config"})
 
     @config_bp.route('/config', methods=['POST'])
     def update_config():
@@ -114,10 +122,7 @@ def create_config_blueprint():
             })
 
         except Exception as e:
-            return jsonify({
-                "success": False,
-                "error": f"更新配置失败: {str(e)}"
-            }), 500
+            return api_error_response(e, context={"endpoint": "/api/config"})
 
     # ==================== 连接测试 ====================
 
@@ -137,19 +142,28 @@ def create_config_blueprint():
         - success: 是否成功
         - message: 测试结果消息
         """
+        data = {}
+        config = {}
         try:
-            data = request.get_json()
+            data = request.get_json(silent=True) or {}
             provider_type = data.get('type')
             provider_name = data.get('provider_name')
 
             if not provider_type:
-                return jsonify({"success": False, "error": "缺少 type 参数"}), 400
+                return api_error_response(
+                    validation_error("缺少 type 参数", "请选择服务商类型后再测试连接。")
+                )
+            if provider_type not in ['google_genai', 'google_gemini', 'openai_compatible', 'image_api']:
+                return api_error_response(
+                    validation_error(f"不支持的类型: {provider_type}", "请选择正确的服务商类型后再测试连接。")
+                )
 
             # 构建配置
             config = {
                 'api_key': data.get('api_key'),
                 'base_url': data.get('base_url'),
-                'model': data.get('model')
+                'model': data.get('model'),
+                'endpoint_type': data.get('endpoint_type')
             }
 
             # 如果没有提供 api_key，从配置文件读取
@@ -157,14 +171,24 @@ def create_config_blueprint():
                 config = _load_provider_config(provider_type, provider_name, config)
 
             if not config['api_key']:
-                return jsonify({"success": False, "error": "API Key 未配置"}), 400
+                return api_error_response(
+                    validation_error("API Key 未配置", "请先填写并保存该服务商的 API Key。"),
+                    context=_error_context(provider_type, provider_name, config),
+                )
 
             # 根据类型执行测试
             result = _test_provider_connection(provider_type, config)
             return jsonify(result), 200 if result['success'] else 400
 
         except Exception as e:
-            return jsonify({"success": False, "error": str(e)}), 400
+            return api_error_response(
+                e,
+                context=_error_context(
+                    data.get('type') if data else None,
+                    data.get('provider_name') if data else None,
+                    config or data,
+                ),
+            )
 
     return config_bp
 
@@ -286,7 +310,7 @@ def _test_provider_connection(provider_type: str, config: dict) -> dict:
     Returns:
         dict: 测试结果
     """
-    test_prompt = "请回复'你好，红墨'"
+    test_prompt = "请只回复：红墨连接测试成功"
 
     if provider_type == 'google_genai':
         return _test_google_genai(config)
@@ -302,6 +326,19 @@ def _test_provider_connection(provider_type: str, config: dict) -> dict:
 
     else:
         raise ValueError(f"不支持的类型: {provider_type}")
+
+
+def _error_context(provider_type: str = None, provider_name: str = None, config: dict = None) -> dict:
+    config = config or {}
+    base_url = config.get('base_url')
+    endpoint_type = config.get('endpoint_type')
+    return {
+        "provider_type": provider_type,
+        "provider": provider_name,
+        "base_url": base_url,
+        "model": config.get('model'),
+        "endpoint": endpoint_type,
+    }
 
 
 def _test_google_genai(config: dict) -> dict:
@@ -364,36 +401,8 @@ def _test_google_gemini(config: dict, test_prompt: str) -> dict:
 
 def _test_openai_compatible(config: dict, test_prompt: str) -> dict:
     """测试 OpenAI 兼容接口"""
-    import requests
-
-    base_url = config['base_url'].rstrip('/') if config.get('base_url') else 'https://api.openai.com'
-    if base_url.endswith('/v1'):
-        base_url = base_url[:-3]
-    url = f"{base_url}/v1/chat/completions"
-
-    payload = {
-        "model": config.get('model') or 'gpt-3.5-turbo',
-        "messages": [{"role": "user", "content": test_prompt}],
-        "max_tokens": 50
-    }
-
-    response = requests.post(
-        url,
-        headers={
-            'Authorization': f"Bearer {config['api_key']}",
-            'Content-Type': 'application/json'
-        },
-        json=payload,
-        timeout=30
-    )
-
-    if response.status_code != 200:
-        raise Exception(f"HTTP {response.status_code}: {response.text[:200]}")
-
-    result = response.json()
-    result_text = result['choices'][0]['message']['content']
-
-    return _check_response(result_text)
+    result = _test_openai_chat_completion(config, test_prompt)
+    return _check_response(result)
 
 
 def _test_image_api(config: dict) -> dict:
@@ -406,30 +415,13 @@ def _test_image_api(config: dict) -> dict:
 
     endpoint_type = config.get('endpoint_type', '')
 
-    # 如果端点是 chat/completions 类型（如豆包），用 POST 发送简单请求来测试
+    # 如果端点是 chat/completions 类型，用真实 LLM 请求来测试
     if endpoint_type and ('chat' in endpoint_type or 'completions' in endpoint_type):
-        endpoint = endpoint_type if endpoint_type.startswith('/') else '/' + endpoint_type
-        url = f"{base_url}{endpoint}"
-        response = requests.post(
-            url,
-            headers={
-                'Authorization': f"Bearer {config['api_key']}",
-                'Content-Type': 'application/json'
-            },
-            json={
-                "model": config.get('model', 'test'),
-                "messages": [{"role": "user", "content": "test"}],
-                "max_tokens": 1
-            },
-            timeout=30
+        result = _test_openai_chat_completion(
+            config,
+            "请只回复：红墨连接测试成功",
         )
-        # 只要不是 401/403 认证错误，就说明连接可用
-        if response.status_code in (401, 403):
-            raise Exception(f"HTTP {response.status_code}: {response.text[:200]}")
-        return {
-            "success": True,
-            "message": "连接成功！仅代表连接稳定，不确定是否可以稳定支持图片生成"
-        }
+        return _llm_smoke_response_payload(result)
 
     # 标准 images API，尝试 /v1/models
     url = f"{base_url}/v1/models"
@@ -448,15 +440,169 @@ def _test_image_api(config: dict) -> dict:
         raise Exception(f"HTTP {response.status_code}: {response.text[:200]}")
 
 
-def _check_response(result_text: str) -> dict:
+def _test_openai_chat_completion(config: dict, test_prompt: str) -> LlmSmokeResult:
+    """用当前配置发送一次真实 OpenAI-compatible LLM 请求。"""
+    import requests
+
+    base_url = _normalize_base_url(config.get('base_url') or 'https://api.openai.com')
+    endpoint = _normalize_endpoint(config.get('endpoint_type') or '/v1/chat/completions')
+    url = f"{base_url}{endpoint}"
+
+    payload = {
+        "model": config.get('model') or 'gpt-3.5-turbo',
+        "messages": [{"role": "user", "content": test_prompt}],
+        "max_tokens": 256,
+        "stream": False
+    }
+    headers = {
+        'Authorization': f"Bearer {config['api_key']}",
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+    }
+
+    response = requests.post(
+        url,
+        headers=headers,
+        json=payload,
+        timeout=30
+    )
+    if _should_retry_with_max_completion_tokens(response):
+        retry_payload = dict(payload)
+        retry_payload["max_completion_tokens"] = retry_payload.pop("max_tokens")
+        response = requests.post(
+            url,
+            headers=headers,
+            json=retry_payload,
+            timeout=30
+        )
+
+    if response.status_code != 200:
+        raise Exception(f"HTTP {response.status_code}: {response.text[:500]}")
+
+    try:
+        result = response.json()
+    except Exception as exc:
+        raise Exception(f"LLM 响应不是合法 JSON: {response.text[:500]}") from exc
+
+    smoke_result = _extract_chat_completion_text(result)
+    if not smoke_result.text.strip() and smoke_result.source not in ["reasoning_tokens"]:
+        raise Exception(
+            "LLM 响应为空。\n"
+            f"响应数据: {str(result)[:500]}"
+        )
+    return smoke_result
+
+
+def _extract_chat_completion_text(result: dict) -> LlmSmokeResult:
+    choices = result.get('choices')
+    if not isinstance(choices, list) or not choices:
+        raise Exception(
+            "LLM 响应格式异常：未找到 choices。\n"
+            f"响应数据: {str(result)[:500]}"
+        )
+
+    choice = choices[0] if isinstance(choices[0], dict) else {}
+    finish_reason = choice.get('finish_reason') or ""
+    message = choice.get('message', {}) if isinstance(choice, dict) else {}
+    content = message.get('content')
+    if isinstance(content, str) and content.strip():
+        return LlmSmokeResult(content.strip(), "content", finish_reason)
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get('text') or item.get('content')
+                if isinstance(text, str):
+                    parts.append(text)
+        joined = "\n".join(parts).strip()
+        if joined:
+            return LlmSmokeResult(joined, "content", finish_reason)
+
+    reasoning_content = message.get('reasoning_content') or message.get('reasoning')
+    if isinstance(reasoning_content, str) and reasoning_content.strip():
+        return LlmSmokeResult(reasoning_content.strip(), "reasoning_content", finish_reason)
+
+    if finish_reason == "length" and _extract_reasoning_token_count(result) > 0:
+        return LlmSmokeResult("", "reasoning_tokens", finish_reason)
+
+    raise Exception(
+        "LLM 响应格式异常：未找到 message.content 或 reasoning_content。\n"
+        f"响应数据: {str(result)[:500]}"
+    )
+
+
+def _extract_reasoning_token_count(result: dict) -> int:
+    usage = result.get("usage") if isinstance(result, dict) else {}
+    if not isinstance(usage, dict):
+        return 0
+    for details_key in ["completion_tokens_details", "output_tokens_details"]:
+        details = usage.get(details_key)
+        if isinstance(details, dict):
+            value = details.get("reasoning_tokens")
+            if isinstance(value, int):
+                return value
+    return 0
+
+
+def _should_retry_with_max_completion_tokens(response) -> bool:
+    if response.status_code not in [400, 422]:
+        return False
+    text = (response.text or "").lower()
+    return (
+        "max_tokens" in text
+        and (
+            "max_completion_tokens" in text
+            or "not compatible" in text
+            or "unsupported" in text
+            or "不支持" in text
+        )
+    )
+
+
+def _normalize_base_url(base_url: str) -> str:
+    base_url = base_url.rstrip('/')
+    if base_url.endswith('/v1'):
+        return base_url[:-3]
+    return base_url
+
+
+def _normalize_endpoint(endpoint: str) -> str:
+    if endpoint == 'chat':
+        endpoint = '/v1/chat/completions'
+    elif endpoint == 'images':
+        endpoint = '/v1/images/generations'
+    if not endpoint.startswith('/'):
+        endpoint = '/' + endpoint
+    return endpoint
+
+
+def _format_llm_success_message(result: LlmSmokeResult) -> str:
+    if result.source in ["reasoning_content", "reasoning_tokens"]:
+        suffix = "，输出预算已耗尽" if result.finish_reason == "length" else ""
+        return f"LLM 请求成功！模型返回了推理过程但没有最终文本{suffix}。如果正式生成也出现空内容，请提高输出上限或关闭思考模式后重试。"
+    return f"LLM 请求成功！响应: {result.text[:100]}"
+
+
+def _llm_smoke_response_payload(result: LlmSmokeResult) -> dict:
+    payload = {
+        "success": True,
+        "message": _format_llm_success_message(result),
+    }
+    if result.source in ["reasoning_content", "reasoning_tokens"]:
+        payload["warning"] = True
+        payload["status"] = "warning"
+    return payload
+
+
+def _check_response(result: LlmSmokeResult) -> dict:
     """检查响应是否符合预期"""
-    if "你好" in result_text and "红墨" in result_text:
-        return {
-            "success": True,
-            "message": f"连接成功！响应: {result_text[:100]}"
-        }
+    if result.source in ["reasoning_content", "reasoning_tokens"]:
+        return _llm_smoke_response_payload(result)
+
+    if "红墨" in result.text:
+        return _llm_smoke_response_payload(result)
     else:
         return {
             "success": True,
-            "message": f"连接成功，但响应内容不符合预期: {result_text[:100]}"
+            "message": f"LLM 请求成功，但响应内容不符合预期: {result.text[:100]}"
         }
